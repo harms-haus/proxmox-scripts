@@ -275,15 +275,20 @@ else
     
     # Build and run - use cargo run with release mode for better performance
     # Save all output to log file, then extract just the key line
+    # Note: timeout uses seconds (1800 = 30 minutes)
     msg_info "Building and running keybroker..."
-    timeout 1800 cargo run --release -p keybroker --bin generate_key -- "$INSTANCE_NAME" "$INSTANCE_SECRET" > /tmp/keybroker_output.log 2>&1
-    CARGO_EXIT_CODE=$?
+    if timeout 1800 cargo run --release -p keybroker --bin generate_key -- "$INSTANCE_NAME" "$INSTANCE_SECRET" > /tmp/keybroker_output.log 2>&1; then
+      CARGO_EXIT_CODE=0
+      msg_info "Key generation completed successfully"
+    else
+      CARGO_EXIT_CODE=$?
+      msg_warn "Cargo command exited with code $CARGO_EXIT_CODE"
+    fi
     
     # Extract the admin key from the output (should be on its own line)
-    ADMIN_KEY_OUTPUT=$(cat /tmp/keybroker_output.log)
+    ADMIN_KEY_OUTPUT=$(cat /tmp/keybroker_output.log 2>/dev/null || echo "")
     
     if [[ $CARGO_EXIT_CODE -ne 0 ]]; then
-      msg_warn "Cargo command exited with code $CARGO_EXIT_CODE"
       msg_info "Check /tmp/keybroker_output.log for details"
     fi
     
@@ -317,10 +322,15 @@ else
     else
       msg_warn "Key generation failed or output format unexpected."
       msg_info "Full output saved to /tmp/keybroker_output.log"
-      msg_info "Last 30 lines of output:"
-      echo "$ADMIN_KEY_OUTPUT" | tail -30
-      msg_info "If compilation succeeded, the key might be in the output above."
-      msg_info "Look for a line containing: ${INSTANCE_NAME}|..."
+      msg_info "Cargo exit code: $CARGO_EXIT_CODE"
+      if [[ -f /tmp/keybroker_output.log ]]; then
+        msg_info "Last 30 lines of output:"
+        tail -30 /tmp/keybroker_output.log
+        msg_info "Searching for lines containing '${INSTANCE_NAME}':"
+        grep -i "${INSTANCE_NAME}" /tmp/keybroker_output.log | head -5 || echo "  (no matches found)"
+      else
+        msg_warn "Log file /tmp/keybroker_output.log not found"
+      fi
       ADMIN_KEY="<will-generate-after-start>"
     fi
     
