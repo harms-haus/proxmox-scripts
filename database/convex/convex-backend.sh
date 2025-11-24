@@ -240,41 +240,63 @@ echo "$INSTANCE_SECRET" > /opt/convex-backend/instance_secret.txt
 chmod 600 /opt/convex-backend/instance_secret.txt
 msg_ok "Generated Instance Secret"
 
-msg_info "Installing Rust for Admin Key Generation"
-# Install rust minimally for key generation
-DEBIAN_FRONTEND=noninteractive $STD apt-get install -y build-essential git
+msg_info "Generating Admin Key"
+ADMIN_KEY=""
+msg_info "Installing Rust (this may take a few minutes)..."
+# Install Rust with stable toolchain for key generation
+DEBIAN_FRONTEND=noninteractive $STD apt-get install -y build-essential git pkg-config libssl-dev
 if ! command -v cargo &> /dev/null; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none 2>/dev/null
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal 2>&1 | grep -v "info:" || true
   source "$HOME/.cargo/env" 2>/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
 fi
-msg_ok "Installed Rust"
 
-msg_info "Generating Admin Key"
-# Clone repo temporarily to get keybroker
-cd /tmp
-if [[ ! -d /tmp/convex-backend-keygen ]]; then
-  git clone --depth 1 https://github.com/get-convex/convex-backend.git convex-backend-keygen 2>/dev/null || true
-fi
-
-if [[ -d /tmp/convex-backend-keygen ]]; then
-  cd /tmp/convex-backend-keygen
-  # Try to generate admin key using cargo
-  ADMIN_KEY_OUTPUT=$(cargo run -p keybroker --bin generate_key -- "$INSTANCE_NAME" "$INSTANCE_SECRET" 2>/dev/null || echo "")
-  if [[ -n "$ADMIN_KEY_OUTPUT" ]]; then
-    ADMIN_KEY=$(echo "$ADMIN_KEY_OUTPUT" | grep -oP "${INSTANCE_NAME}\|[^\s]+" | head -1)
-  fi
-  cd /opt/convex-backend
-  rm -rf /tmp/convex-backend-keygen
-fi
-
-# If still no admin key, we'll generate it after service starts
-if [[ -z "$ADMIN_KEY" ]]; then
-  msg_warn "Could not generate admin key now. Will generate after service starts."
+# Verify Rust is installed
+if ! command -v cargo &> /dev/null; then
+  msg_warn "Rust installation failed. Admin key will need to be generated manually."
   ADMIN_KEY="<will-generate-after-start>"
 else
-  echo "$ADMIN_KEY" > /opt/convex-backend/admin_key.txt
-  chmod 600 /opt/convex-backend/admin_key.txt
-  msg_ok "Generated Admin Key"
+  msg_info "Rust installed. Compiling keybroker (this may take 5-15 minutes)..."
+  msg_info "Please be patient - Rust compilation is in progress..."
+  
+  # Clone repo temporarily to get keybroker
+  cd /tmp
+  if [[ ! -d /tmp/convex-backend-keygen ]]; then
+    if ! git clone --depth 1 https://github.com/get-convex/convex-backend.git convex-backend-keygen 2>/dev/null; then
+      msg_error "Failed to clone repository"
+      ADMIN_KEY="<will-generate-after-start>"
+    fi
+  fi
+
+  if [[ -d /tmp/convex-backend-keygen ]] && [[ -z "$ADMIN_KEY" ]]; then
+    cd /tmp/convex-backend-keygen
+    
+    # Compile and run keybroker with timeout (30 minutes max)
+    msg_info "Compiling keybroker tool..."
+    ADMIN_KEY_OUTPUT=$(timeout 1800 cargo run --quiet -p keybroker --bin generate_key -- "$INSTANCE_NAME" "$INSTANCE_SECRET" 2>&1 || echo "")
+    
+    if [[ -n "$ADMIN_KEY_OUTPUT" ]] && echo "$ADMIN_KEY_OUTPUT" | grep -q "$INSTANCE_NAME"; then
+      ADMIN_KEY=$(echo "$ADMIN_KEY_OUTPUT" | grep -oP "${INSTANCE_NAME}\|[^\s]+" | head -1)
+      if [[ -n "$ADMIN_KEY" ]]; then
+        echo "$ADMIN_KEY" > /opt/convex-backend/admin_key.txt
+        chmod 600 /opt/convex-backend/admin_key.txt
+        msg_ok "Generated Admin Key"
+      else
+        msg_warn "Could not parse admin key from output"
+        ADMIN_KEY="<will-generate-after-start>"
+      fi
+    else
+      msg_warn "Key generation failed or timed out. Admin key will need to be generated manually."
+      ADMIN_KEY="<will-generate-after-start>"
+    fi
+    
+    cd /opt/convex-backend
+    rm -rf /tmp/convex-backend-keygen
+  fi
+  
+  # Ensure ADMIN_KEY is set
+  if [[ -z "$ADMIN_KEY" ]]; then
+    ADMIN_KEY="<will-generate-after-start>"
+  fi
 fi
 
 # Dashboard installation (optional)
@@ -382,41 +404,25 @@ fi
 
 # Generate admin key if not already generated
 if [[ "$ADMIN_KEY" == "<will-generate-after-start>" ]]; then
-  msg_info "Generating Admin Key (waiting for service to be ready)"
-  sleep 8
-  
-  # Try to generate using cargo again now that service might be running
-  if command -v cargo &> /dev/null; then
-    cd /tmp
-    if [[ ! -d /tmp/convex-backend-keygen ]]; then
-      git clone --depth 1 https://github.com/get-convex/convex-backend.git convex-backend-keygen 2>/dev/null || true
-    fi
-    
-    if [[ -d /tmp/convex-backend-keygen ]]; then
-      cd /tmp/convex-backend-keygen
-      ADMIN_KEY_OUTPUT=$(cargo run -p keybroker --bin generate_key -- "$INSTANCE_NAME" "$INSTANCE_SECRET" 2>/dev/null || echo "")
-      if [[ -n "$ADMIN_KEY_OUTPUT" ]]; then
-        ADMIN_KEY=$(echo "$ADMIN_KEY_OUTPUT" | grep -oP "${INSTANCE_NAME}\|[^\s]+" | head -1)
-        if [[ -n "$ADMIN_KEY" ]]; then
-          echo "$ADMIN_KEY" > /opt/convex-backend/admin_key.txt
-          chmod 600 /opt/convex-backend/admin_key.txt
-          msg_ok "Generated Admin Key"
-        fi
-      fi
-      rm -rf /tmp/convex-backend-keygen
-    fi
-  fi
-  
-  # If still no key, provide instructions
-  if [[ ! -f /opt/convex-backend/admin_key.txt ]] || [[ -z "$(cat /opt/convex-backend/admin_key.txt 2>/dev/null)" ]]; then
-    msg_warn "Admin key not auto-generated. To generate it manually:"
-    echo -e "${TAB}1. Install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-    echo -e "${TAB}2. Clone repo: git clone https://github.com/get-convex/convex-backend.git /tmp/convex-keygen"
-    echo -e "${TAB}3. Generate key: cd /tmp/convex-keygen && cargo run -p keybroker --bin generate_key -- convex-self-hosted \$(cat /opt/convex-backend/instance_secret.txt)"
-    ADMIN_KEY="<see-instructions-above>"
-  else
-    ADMIN_KEY=$(cat /opt/convex-backend/admin_key.txt)
-  fi
+  msg_info "Admin key generation skipped (requires Rust compilation)"
+  msg_info "To generate admin key manually, run:"
+  echo ""
+  echo -e "${TAB}${GN}Option 1 - Quick (if Rust is installed):${CL}"
+  echo -e "${TAB}  cd /tmp"
+  echo -e "${TAB}  git clone --depth 1 https://github.com/get-convex/convex-backend.git convex-keygen"
+  echo -e "${TAB}  cd convex-keygen"
+  echo -e "${TAB}  cargo run -p keybroker --bin generate_key -- convex-self-hosted \$(cat /opt/convex-backend/instance_secret.txt)"
+  echo -e "${TAB}  rm -rf /tmp/convex-keygen"
+  echo ""
+  echo -e "${TAB}${GN}Option 2 - Install Rust first:${CL}"
+  echo -e "${TAB}  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+  echo -e "${TAB}  source \$HOME/.cargo/env"
+  echo -e "${TAB}  Then follow Option 1"
+  echo ""
+  echo -e "${TAB}${YW}Note:${CL} Admin key generation requires compiling Rust code and may take 5-15 minutes."
+  echo -e "${TAB}The Convex backend will work without an admin key, but admin features will be limited."
+  echo ""
+  ADMIN_KEY="<see-instructions-above>"
 fi
 
 # Start dashboard if installed
