@@ -242,9 +242,10 @@ msg_ok "Generated Instance Secret"
 
 msg_info "Generating Admin Key"
 ADMIN_KEY=""
-msg_info "Installing Rust (this may take a few minutes)..."
+msg_info "Installing Rust and build dependencies (this may take a few minutes)..."
 # Install Rust with stable toolchain for key generation
-DEBIAN_FRONTEND=noninteractive $STD apt-get install -y build-essential git pkg-config libssl-dev
+# cmake is required for some Rust dependencies like libz-ng-sys
+DEBIAN_FRONTEND=noninteractive $STD apt-get install -y build-essential git pkg-config libssl-dev cmake
 if ! command -v cargo &> /dev/null; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal 2>&1 | grep -v "info:" || true
   source "$HOME/.cargo/env" 2>/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
