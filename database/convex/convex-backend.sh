@@ -271,21 +271,56 @@ else
     cd /tmp/convex-backend-keygen
     
     # Compile and run keybroker with timeout (30 minutes max)
-    msg_info "Compiling keybroker tool..."
-    ADMIN_KEY_OUTPUT=$(timeout 1800 cargo run --quiet -p keybroker --bin generate_key -- "$INSTANCE_NAME" "$INSTANCE_SECRET" 2>&1 || echo "")
+    msg_info "Compiling keybroker tool (this will take several minutes)..."
     
-    if [[ -n "$ADMIN_KEY_OUTPUT" ]] && echo "$ADMIN_KEY_OUTPUT" | grep -q "$INSTANCE_NAME"; then
-      ADMIN_KEY=$(echo "$ADMIN_KEY_OUTPUT" | grep -oP "${INSTANCE_NAME}\|[^\s]+" | head -1)
-      if [[ -n "$ADMIN_KEY" ]]; then
-        echo "$ADMIN_KEY" > /opt/convex-backend/admin_key.txt
-        chmod 600 /opt/convex-backend/admin_key.txt
-        msg_ok "Generated Admin Key"
-      else
-        msg_warn "Could not parse admin key from output"
-        ADMIN_KEY="<will-generate-after-start>"
+    # Build and run - use cargo run with release mode for better performance
+    # Save all output to log file, then extract just the key line
+    msg_info "Building and running keybroker..."
+    timeout 1800 cargo run --release -p keybroker --bin generate_key -- "$INSTANCE_NAME" "$INSTANCE_SECRET" > /tmp/keybroker_output.log 2>&1
+    CARGO_EXIT_CODE=$?
+    
+    # Extract the admin key from the output (should be on its own line)
+    ADMIN_KEY_OUTPUT=$(cat /tmp/keybroker_output.log)
+    
+    if [[ $CARGO_EXIT_CODE -ne 0 ]]; then
+      msg_warn "Cargo command exited with code $CARGO_EXIT_CODE"
+      msg_info "Check /tmp/keybroker_output.log for details"
+    fi
+    
+    # Try multiple patterns to extract the admin key
+    # Expected format: instance_name|key (e.g., "convex-self-hosted|abc123...")
+    if [[ -n "$ADMIN_KEY_OUTPUT" ]]; then
+      # First, try to find a line that matches the exact pattern: instance_name|alphanumeric
+      ADMIN_KEY=$(echo "$ADMIN_KEY_OUTPUT" | grep -oE "${INSTANCE_NAME}\|[a-zA-Z0-9]+" | head -1 | tr -d '\r\n' | xargs || echo "")
+      
+      # If that didn't work, look for lines containing the instance name and pipe
+      if [[ -z "$ADMIN_KEY" ]]; then
+        ADMIN_KEY=$(echo "$ADMIN_KEY_OUTPUT" | grep "${INSTANCE_NAME}" | grep "|" | head -1 | tr -d '\r\n' | xargs || echo "")
       fi
+      
+      # If still no key, try extracting from any line with the instance name
+      if [[ -z "$ADMIN_KEY" ]] && echo "$ADMIN_KEY_OUTPUT" | grep -q "$INSTANCE_NAME"; then
+        # Look for the pattern instance_name| followed by alphanumeric characters
+        ADMIN_KEY=$(echo "$ADMIN_KEY_OUTPUT" | sed -n "s/.*\(${INSTANCE_NAME}|[a-zA-Z0-9]\+\).*/\1/p" | head -1 | tr -d '\r\n' | xargs || echo "")
+      fi
+      
+      # Last resort: find any line that looks like a key (instance_name| followed by alphanumeric)
+      if [[ -z "$ADMIN_KEY" ]]; then
+        ADMIN_KEY=$(echo "$ADMIN_KEY_OUTPUT" | awk "/${INSTANCE_NAME}\|/{print; exit}" | tr -d '\r\n' | xargs || echo "")
+      fi
+    fi
+    
+    if [[ -n "$ADMIN_KEY" ]] && [[ "$ADMIN_KEY" =~ ^${INSTANCE_NAME}\| ]] && [[ ${#ADMIN_KEY} -gt ${#INSTANCE_NAME} ]]; then
+      echo "$ADMIN_KEY" > /opt/convex-backend/admin_key.txt
+      chmod 600 /opt/convex-backend/admin_key.txt
+      msg_ok "Generated Admin Key: ${ADMIN_KEY:0:30}..."
     else
-      msg_warn "Key generation failed or timed out. Admin key will need to be generated manually."
+      msg_warn "Key generation failed or output format unexpected."
+      msg_info "Full output saved to /tmp/keybroker_output.log"
+      msg_info "Last 30 lines of output:"
+      echo "$ADMIN_KEY_OUTPUT" | tail -30
+      msg_info "If compilation succeeded, the key might be in the output above."
+      msg_info "Look for a line containing: ${INSTANCE_NAME}|..."
       ADMIN_KEY="<will-generate-after-start>"
     fi
     
